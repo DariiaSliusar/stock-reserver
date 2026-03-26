@@ -17,6 +17,7 @@ return new class extends Migration
             $table->unsignedInteger('qty');
             $table->string('status')->default('pending');
             $table->string('supplier_ref')->nullable();
+            $table->string('supplier_status')->nullable();
             $table->unsignedTinyInteger('supplier_attempts')->default(0);
             $table->timestamps();
         });
