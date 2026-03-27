@@ -1,58 +1,506 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Система Резервування Товарів
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Подієво-орієнтована система управління запасами з асинхронною обробкою замовлень та інтеграцією з постачальниками.
 
-## About Laravel
+## Архітектура Системи
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+### Основні Компоненти
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+- **Система Подій**: Подія OrderCreated запускає асинхронне резервування запасів
+- **Черга Завдань**: Черга на базі Redis для неблокуючої обробки
+- **Інтеграція з Постачальником**: Виклики зовнішнього API з логікою повторних спроб
+- **Машина Станів**: Переходи статусів замовлень з валідацією
+- **Аудит**: Повна історія рухів запасів
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+## Потік Подій
 
-## Learning Laravel
+### 1. Створення Замовлення
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
-
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
-
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
-
-```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+```
+POST /api/orders
+Body: { "sku": "ABC123", "qty": 3 }
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+**Процес:**
+1. HTTP запит отримується контролером `OrderController::store()`
+2. Валідація через `StoreOrderRequest` (sku: рядок макс 64, qty: ціле число 1-10000)
+3. Замовлення створюється зі статусом `pending`
+4. Відправляється подія `OrderCreated`
+5. Відповідь повертається негайно (201 Created)
 
-## Contributing
+### 2. Резервування Запасів (Асинхронне)
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+**Тригер:** Подія `OrderCreated` обробляється слухачем `ReserveInventoryListener` (реалізує ShouldQueue)
 
-## Code of Conduct
+**Процес:**
+1. Слухач відправляє `ReserveInventoryJob` у чергу
+2. Job отримує блокування рядка бази даних (`lockForUpdate()`)
+3. Точка прийняття рішення на основі доступності запасів:
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+#### Сценарій A: Достатньо Товару
 
-## Security Vulnerabilities
+```
+Перевірка запасів -> hasEnoughStock(qty) = true
+                   -> зменшення qty_available
+                   -> збільшення qty_reserved
+                   -> Статус замовлення: reserved
+                   -> Створення InventoryMovement (тип: reserved)
+                   -> Логування успіху
+```
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+**Транзакція бази даних:**
+- Блокування рядка inventory
+- Оновлення qty_available: -qty
+- Оновлення qty_reserved: +qty
+- Оновлення статусу замовлення: pending -> reserved
+- Вставка запису inventory_movement
+- Commit транзакції
 
-## License
+#### Сценарій B: Недостатньо Товару
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+```
+Перевірка запасів -> hasEnoughStock(qty) = false
+                   -> Виклик SupplierService::reserve()
+                   -> Відповідь постачальника: { "accepted": true, "ref": "SUP-123" }
+                   -> Статус замовлення: awaiting_restock
+                   -> Планування CheckSupplierStatusJob (+15 секунд)
+```
+
+**Важливо:** Підтвердження постачальника НЕ гарантує доставку.
+
+### 3. Перевірка Статусу Постачальника
+
+**Job:** `CheckSupplierStatusJob` (запланований з затримкою 15 секунд)
+
+**Процес:**
+1. Виклик `GET /supplier/status/{ref}`
+2. Парсинг статусу відповіді: ok | fail | delayed
+3. Обробка відповіді:
+
+#### Статус: ok
+```
+- Отримання блокування inventory
+- Створення/оновлення запису Inventory
+- Збільшення qty_reserved на кількість замовлення
+- Перехід замовлення: awaiting_restock -> reserved
+- Створення InventoryMovement (тип: restocked)
+- Логування підтвердження
+```
+
+#### Статус: fail
+```
+- Перехід замовлення: awaiting_restock -> failed
+- Логування причини відмови
+- Без змін у запасах
+```
+
+#### Статус: delayed
+```
+- Перевірка лічильника спроб затримки
+- Якщо спроби < 2:
+    - Збільшення лічильника спроб
+    - Планування нового CheckSupplierStatusJob (+15 секунд)
+    - Логування запланованого повтору
+- Якщо спроби >= 2:
+    - Перехід замовлення: awaiting_restock -> failed
+    - Логування перевищення максимальних спроб
+```
+
+**Логіка Максимальних Повторів:**
+- Перша перевірка: 15 секунд після підтвердження постачальника (спроба 0)
+- Якщо delayed: Друга перевірка через +30 секунд (спроба 1)
+- Якщо знову delayed: Замовлення позначається як failed (досягнуто максимум 2 спроби)
+
+### 4. Машина Станів
+
+**Переходи Статусів Замовлення:**
+
+```
+pending -> reserved             (достатньо товару)
+pending -> awaiting_restock     (запит до постачальника прийнято)
+pending -> failed               (постачальник відхилив)
+
+awaiting_restock -> reserved    (постачальник доставив)
+awaiting_restock -> failed      (постачальник відмовив або максимум повторів)
+
+reserved -> (кінцевий стан)
+failed -> (кінцевий стан)
+```
+
+**Валідація:**
+- `Order::transitionTo()` валідує переходи через `OrderStatus::canTransitionTo()`
+- Невалідні переходи викидають `LogicException`
+- Кінцеві стани (reserved, failed) не можуть переходити далі
+
+## API Ендпоінти
+
+### Створення Замовлення
+```
+POST /api/orders
+Content-Type: application/json
+
+{
+  "sku": "ABC123",
+  "qty": 3
+}
+
+Відповідь: 201 Created
+{
+  "data": {
+    "id": 1,
+    "sku": "ABC123",
+    "qty": 3,
+    "status": "pending",
+    "status_label": "Очікується",
+    "supplier_ref": null,
+    "created_at": "2026-03-27T10:00:00Z",
+    "updated_at": "2026-03-27T10:00:00Z"
+  },
+  "message": "Замовлення прийнято в обробку."
+}
+```
+
+### Отримання Деталей Замовлення
+```
+GET /api/orders/{id}
+
+Відповідь: 200 OK
+{
+  "data": {
+    "id": 1,
+    "sku": "ABC123",
+    "qty": 3,
+    "status": "reserved",
+    "status_label": "Зарезервовано",
+    "supplier_ref": null,
+    "created_at": "2026-03-27T10:00:00Z",
+    "updated_at": "2026-03-27T10:00:15Z",
+    "movements": [
+      {
+        "id": 1,
+        "type": "reserved",
+        "type_label": "Зарезервовано",
+        "qty": 3,
+        "note": null,
+        "created_at": "2026-03-27T10:00:15Z"
+      }
+    ]
+  }
+}
+```
+
+### Отримання Рухів Запасів
+```
+GET /api/inventory/{sku}/movements
+
+Відповідь: 200 OK
+{
+  "success": true,
+  "data": {
+    "sku": "ABC123",
+    "qty_available": 97,
+    "qty_reserved": 3,
+    "movements": [
+      {
+        "id": 1,
+        "order_id": 1,
+        "qty": 3,
+        "type": "reserved",
+        "created_at": "2026-03-27T10:00:15Z",
+        "order": {
+          "id": 1,
+          "status": "reserved"
+        }
+      }
+    ]
+  },
+  "meta": {
+    "sku": "ABC123",
+    "total": 1
+  }
+}
+```
+
+## Стратегія Обробки Помилок
+
+### 1. Рівень Бази Даних
+
+**Запобігання Race Condition:**
+- `lockForUpdate()` для запитів до inventory всередині транзакцій
+- Забезпечує атомарні операції читання-модифікації-запису
+- Запобігає перепродажу при одночасній обробці кількох замовлень
+
+**Відкат Транзакцій:**
+- Всі операції з запасами обгорнуті в DB транзакції
+- Автоматичний відкат при винятках
+- Підтримує консистентність даних
+
+### 2. Інтеграція з Постачальником
+
+**Мережеві Збої:**
+```php
+try {
+    $response = Http::post($url, $data);
+    if ($response->successful()) {
+        return $response->json();
+    }
+    return ['accepted' => false, 'ref' => ''];
+} catch (\Throwable $e) {
+    Log::error("Supplier reserve failed: " . $e->getMessage());
+    return ['accepted' => false, 'ref' => ''];
+}
+```
+
+**Обробка Таймаутів:**
+- HTTP клієнт використовує стандартний таймаут Laravel (30с)
+- Невдалі запити повертають безпечне значення: `['accepted' => false]`
+- Замовлення позначається як failed негайно
+
+**Невалідні Відповіді:**
+- `SupplierStatus::tryFrom()` з null coalescing до FAIL
+- Некоректний JSON обробляється як відмова
+- Відсутнє поле 'status' за замовчуванням 'fail'
+
+### 3. Обробка Черг
+
+**Збої Job:**
+- Jobs реалізують інтерфейс `ShouldQueue`
+- Невдалі jobs автоматично повторюються згідно з конфігурацією черги
+- Dead letter queue після максимальних спроб (налаштовується)
+
+**Ідемпотентність:**
+- `CheckSupplierStatusJob` перевіряє чи замовлення вже в кінцевому стані
+- `$freshOrder = $this->order->fresh()` забезпечує актуальний стан
+- Пропуск обробки якщо замовлення вже вирішено
+
+**Серіалізація:**
+- Jobs використовують trait `SerializesModels`
+- Стан моделі оновлюється з бази даних при виконанні job
+- Запобігає проблемам застарілих даних
+
+### 4. Валідація Вхідних Даних
+
+**Валідація Запитів:**
+```php
+'sku' => ['required', 'string', 'max:64']
+'qty' => ['required', 'integer', 'min:1', 'max:10000']
+```
+
+**Валідація Enum:**
+- Типобезпечні значення статусів через PHP enums
+- База даних зберігає рядкові значення, додаток використовує enums
+- Невалідні значення перехоплюються на рівні cast
+
+### 5. Логування
+
+**Структуроване Логування:**
+- Всі критичні операції логуються з контекстом
+- Рівні логів: info (успіх), warning (повтор), error (помилка)
+- Контекст включає: order_id, supplier_ref, номер спроби
+
+**Точки Моніторингу:**
+- Створення замовлення
+- Успіх/невдача резервування
+- Запити/відповіді постачальника
+- Результати перевірки статусу
+- Спроби повтору
+- Переходи до кінцевих станів
+
+## Рекомендації для Production
+
+### 1. Інфраструктура
+
+**Управління Чергами:**
+- Окремі черги для різних пріоритетів завдань (високий: обробка замовлень, низький: сповіщення)
+- Кілька процесів worker на чергу
+- Налаштування `queue.php` для спроб повтору та відкладення
+- Реалізація моніторингу черг та сповіщень
+
+**База Даних:**
+- Додати індекси: `orders.status`, `orders.supplier_ref`, `inventories.sku`
+- Розглянути read репліки для звітних запитів
+- Реалізувати connection pooling
+- Регулярні операції vacuum/optimize
+
+**Кешування:**
+- Кешувати рівні запасів з коротким TTL (5-10 секунд)
+- Інвалідація кешу при змінах запасів
+- Розглянути Redis cache aside pattern
+
+### 2. Інтеграція з Постачальником
+
+**Circuit Breaker:**
+```php
+if ($supplierFailureRate > 0.5 && $recentRequests > 10) {
+    // Відкритий circuit: швидка відмова без виклику постачальника
+    return ['accepted' => false, 'ref' => 'circuit-open'];
+}
+```
+
+**Таймаути:**
+- Встановити явний HTTP таймаут (5-10 секунд)
+- Реалізувати таймаут запиту для перевірок статусу (3-5 секунд)
+- Додати повтор з експоненційним відкладенням для тимчасових збоїв
+
+**Rate Limiting:**
+- Реалізувати rate limiter для викликів API постачальника
+- Ставити запити постачальника в чергу при наближенні до ліміту
+- Моніторити заголовки rate limit у відповідях
+
+**Webhook Альтернатива:**
+- Замість polling реалізувати webhook endpoint для callback від постачальника
+- Постачальник відправляє POST на `/webhook/supplier/status` коли готовий
+- Зменшує непотрібний polling, швидший час відповіді
+
+### 3. Безпека
+
+**Аутентифікація:**
+- Реалізувати аутентифікацію API токенів (Laravel Sanctum)
+- Rate limiting на користувача/токен (throttle middleware)
+- Конфігурація CORS для доступу фронтенду
+
+**Безпека Постачальника:**
+- Валідація підписів webhook (HMAC)
+- Whitelist IP адрес постачальників
+- Зберігання API credentials в зашифрованому сховищі (не .env)
+- Регулярна ротація API ключів постачальника
+
+**Санітизація Вводу:**
+- Валідація формату SKU (тільки буквено-цифрові)
+- Запобігання SQL ін'єкціям (вже обробляється Eloquent)
+- Обмеження розміру тіла запиту
+
+### 4. Моніторинг та Спостережуваність
+
+**Метрики:**
+- Час обробки замовлень (p50, p95, p99)
+- Глибина черги та швидкість обробки
+- Показники успіху/невдачі постачальника
+- Швидкість обороту запасів
+- Кількість невдалих jobs
+
+**Сповіщення:**
+- Глибина черги перевищує поріг
+- Відсоток невдалих jobs > 5%
+- Доступність постачальника < 95%
+- Вичерпання пулу з'єднань бази даних
+- Високий рівень помилок у логах
+
+**Розподілене Трасування:**
+- Реалізація propagation ID запиту
+- Трасування життєвого циклу замовлення через jobs
+- Моніторинг повільних запитів до бази даних
+- Інтеграція APM інструментів (New Relic, Datadog)
+
+### 5. Управління Даними
+
+**Архівування:**
+- Архівувати завершені замовлення після 90 днів
+- Стискати старі рухи запасів
+- Реалізувати soft deletes для аудиту
+
+**Партиціонування:**
+- Партиціонувати `inventory_movements` за датою
+- Розділяти гарячі (останні) та холодні (архівовані) дані
+- Оптимізувати продуктивність запитів на великих датасетах
+
+**Резервні Копії:**
+- Автоматичні щоденні бекапи з point-in-time recovery
+- Регулярно тестувати відновлення з бекапів
+- Реплікувати бекапи в окремий регіон
+
+### 6. Покращення Бізнес-Логіки
+
+**Прогнозування Запасів:**
+- Передбачати дефіцит на основі історичних даних
+- Попереднє замовлення у постачальника при досягненні порогу
+- Зменшення затримок для клієнтів
+
+**Часткове Виконання:**
+- Дозволити розділення замовлень при наявності часткових запасів
+- Резервувати доступну кількість, запитувати залишок
+- Сповіщати клієнта про часткову відправку
+
+**Черга з Пріоритетами:**
+- VIP клієнти або термінові замовлення обробляються першими
+- Критичні SKU пріоритезуються
+- Алгоритм fair scheduling для запобігання starvation
+
+**Закінчення Резервування:**
+- Зарезервовані запаси закінчуються через N годин без підтвердження
+- Автоматизована job для звільнення прострочених резервацій
+- Запобігає безстроковому блокуванню запасів
+
+### 7. Тестування
+
+**Обов'язкові Тести:**
+- Unit тести для бізнес-логіки (переходи станів, обчислення)
+- Feature тести для API ендпоінтів
+- Integration тести для API постачальника (з Http::fake())
+- Тести queue jobs (з Queue::fake())
+- Тести race conditions (паралельні запити)
+- End-to-end тести потоку замовлень
+
+**Навантажувальне Тестування:**
+- Симулювати одночасне створення замовлень (100+ запитів/секунду)
+- Тестувати ємність обробки черги
+- Виявляти вузькі місця під навантаженням
+- Валідувати поведінку блокувань бази даних
+
+### 8. Якість Коду
+
+**Статичний Аналіз:**
+- Застосування PHPStan level 8+
+- Psalm для перевірки типів
+- PHP CS Fixer для стилю коду
+- Pre-commit hooks для автоматичних перевірок
+
+**Документація:**
+- Специфікація OpenAPI/Swagger для API
+- Architectural Decision Records (ADRs)
+- Runbook для типових операційних завдань
+- Документація онбордингу для розробників
+
+**Можливості Рефакторингу:**
+- Винести клієнт постачальника в пакет
+- Реалізувати repository pattern для inventory
+- Створити dedicated DTO класи для відповідей постачальника
+- Перенести бізнес-логіку з jobs до domain services
+
+## Технологічний Стек
+
+- **Фреймворк:** Laravel 13.x
+- **PHP:** 8.3+
+- **База Даних:** SQLite (розробка), PostgreSQL/MySQL (production)
+- **Черга:** Redis/Valkey
+- **Панель Черги:** Laravel Horizon
+- **Тестування:** PHPUnit
+
+## Налаштування для Розробки
+
+```bash
+# Встановлення залежностей
+composer install
+
+# Налаштування середовища
+cp .env.example .env
+php artisan key:generate
+
+# Налаштування бази даних
+php artisan migrate:fresh --seed
+
+# Запуск worker черги
+php artisan queue:work
+
+# Запуск Horizon (рекомендовано)
+php artisan horizon
+
+# Перевірка налаштувань
+php artisan event:list
+php artisan route:list
+```
+
+## Ліцензія
+
+MIT License
+

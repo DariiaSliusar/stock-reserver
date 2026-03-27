@@ -52,7 +52,7 @@ class ReserveInventoryJob implements ShouldQueue
 
         $this->order->update(['status' => 'reserved']);
 
-        InventoryMovement::create([
+        InventoryMovement::query()->create([
             'sku' => $this->order->sku,
             'order_id' => $this->order->id,
             'type' => MovementType::RESERVED,
@@ -74,7 +74,6 @@ class ReserveInventoryJob implements ShouldQueue
 
             Log::info("Order #{$this->order->id} sent to supplier, ref: {$result['ref']}");
 
-            // Schedule the first supplier status check after 15 seconds
             CheckSupplierStatusJob::dispatch($this->order, 0)
                 ->delay(now()->addSeconds(15));
         } else {
