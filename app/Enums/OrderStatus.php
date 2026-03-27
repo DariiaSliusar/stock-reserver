@@ -19,7 +19,22 @@ enum OrderStatus: string
         };
     }
 
+    public function isTerminal(): bool
+    {
+        return match($this) {
+            self::RESERVED, self::FAILED => true,
+            default => false,
+        };
+    }
 
-
+    public function canTransitionTo(self $next): bool
+    {
+        return match($this) {
+            self::PENDING => in_array($next, [self::RESERVED, self::AWAITING_RESTOCK, self::FAILED]),
+            self::AWAITING_RESTOCK => in_array($next, [self::RESERVED, self::FAILED]),
+            self::RESERVED,
+            self::FAILED => false,
+        };
+    }
 
 }
