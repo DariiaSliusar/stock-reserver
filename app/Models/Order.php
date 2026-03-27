@@ -21,4 +21,15 @@ class Order extends Model
     {
         return $this->hasMany(InventoryMovement::class);
     }
+
+    public function transitionTo(OrderStatus $next): void
+    {
+        if (! $this->status->canTransitionTo($next)) {
+            throw new \LogicException(
+                "Cannot transition order #{$this->id} from [{$this->status->value}] to [{$next->value}]"
+            );
+        }
+
+        $this->update(['status' => $next]);
+    }
 }

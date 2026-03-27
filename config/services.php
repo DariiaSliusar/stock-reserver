@@ -35,4 +35,8 @@ return [
         ],
     ],
 
+    'supplier' => [
+        'base_url' => env('SUPPLIER_BASE_URL', 'https://fake-supplier.test'),
+    ],
+
 ];

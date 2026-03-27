@@ -19,9 +19,4 @@ class InventoryMovement extends Model
     {
         return $this->belongsTo(Order::class);
     }
-
-    public function inventory(): BelongsTo
-    {
-        return $this->belongsTo(Inventory::class, 'sku', 'sku');
-    }
 }

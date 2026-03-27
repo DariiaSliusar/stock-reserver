@@ -14,8 +14,14 @@ class Inventory extends Model
         'qty_reserved' => 'integer',
     ];
 
-    public function movements(): HasMany
+    public function hasEnoughStock(int $qty): bool
     {
-        return $this->hasMany(InventoryMovement::class, 'sku', 'sku');
+        return $this->qty_available >= $qty;
+    }
+
+    public function reserve(int $qty): void
+    {
+        $this->decrement('qty_available', $qty);
+        $this->increment('qty_reserved', $qty);
     }
 }
